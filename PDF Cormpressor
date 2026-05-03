@@ -1,0 +1,117 @@
+import sys
+import subprocess
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QFileDialog, QLabel,
+    QLineEdit, QPushButton, QFormLayout, QSpinBox, QComboBox, QCheckBox, QHBoxLayout
+)
+
+class PDFCompressor(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PDF Compressor")
+        self.setMinimumSize(400, 300)
+        self.init_ui()
+
+    def init_ui(self):
+        central = QWidget()
+        layout = QFormLayout()
+
+        self.input_path = QLineEdit()
+        btn_in = QPushButton("Open PDF")
+        btn_in.clicked.connect(self.select_input)
+        h_in = QHBoxLayout()
+        h_in.addWidget(self.input_path)
+        h_in.addWidget(btn_in)
+        layout.addRow("Input PDF:", h_in)
+
+        self.output_path = QLineEdit()
+        btn_out = QPushButton("Save As")
+        btn_out.clicked.connect(self.select_output)
+        h_out = QHBoxLayout()
+        h_out.addWidget(self.output_path)
+        h_out.addWidget(btn_out)
+        layout.addRow("Output PDF:", h_out)
+
+        self.resolutions = {
+            'low(72dpi)': 72,
+            'medium(150dpi)': 150,
+            'high(300dpi)': 300,
+            'custom': None
+        }
+        self.cb_res = QComboBox()
+        self.cb_res.addItems(self.resolutions.keys())
+        self.cb_res.currentTextChanged.connect(self.res_changed)
+        layout.addRow("Image Resolution:", self.cb_res)
+
+        self.custom_res = QSpinBox()
+        self.custom_res.setRange(50, 1200)
+        self.custom_res.setValue(150)
+        self.custom_res.setEnabled(False)
+        layout.addRow("Custom DPI:", self.custom_res)
+
+        self.cb_downsample = QCheckBox()
+        self.cb_downsample.setChecked(True)
+        layout.addRow("Downsample Images:", self.cb_downsample)
+
+        self.cb_color_type = QComboBox()
+        self.cb_color_type.addItems(['/Bicubic', '/Average', '/Subsample'])
+        layout.addRow("Downsample Method:", self.cb_color_type)
+
+        self.spin_quality = QSpinBox()
+        self.spin_quality.setRange(1, 95)
+        self.spin_quality.setValue(85)
+        layout.addRow("JPEG Quality:", self.spin_quality)
+
+        btn_run = QPushButton("Compress")
+        btn_run.clicked.connect(self.compress)
+        layout.addRow(btn_run)
+
+        central.setLayout(layout)
+        self.setCentralWidget(central)
+
+    def res_changed(self, text):
+        self.custom_res.setEnabled(text == 'custom')
+
+    def select_input(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select PDF", "", "PDF Files (*.pdf)")
+        if path:
+            self.input_path.setText(path)
+
+    def select_output(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save PDF As", "", "PDF Files (*.pdf)")
+        if path:
+            self.output_path.setText(path)
+
+    def compress(self):
+        inp = self.input_path.text()
+        out = self.output_path.text()
+        if not inp or not out:
+            return
+        dpi = self.resolutions.get(self.cb_res.currentText()) or self.custom_res.value()
+        down = self.cb_downsample.isChecked()
+        method = self.cb_color_type.currentText()
+        quality = self.spin_quality.value()
+
+        args = [
+            'gs', '-sDEVICE=pdfwrite',
+            f'-dColorImageDownsampleType={method}',
+            f'-dColorImageResolution={dpi}',
+            f'-dGrayImageDownsampleType={method}',
+            f'-dGrayImageResolution={dpi}',
+            f'-dMonoImageDownsampleType={method}',
+            f'-dMonoImageResolution={dpi}',
+            f'-dDownsampleColorImages={str(down).upper()}',
+            f'-dDownsampleGrayImages={str(down).upper()}',
+            f'-dDownsampleMonoImages={str(down).upper()}',
+            f'-dJPEGQ={quality}',
+            '-dNOPAUSE', '-dBATCH', '-dSAFER',
+            f'-sOutputFile={out}', inp
+        ]
+
+        subprocess.run(args)
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = PDFCompressor()
+    window.show()
+    sys.exit(app.exec_())

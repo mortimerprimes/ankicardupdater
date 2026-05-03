@@ -1,0 +1,12 @@
+.DS_Store
+.venv-build/
+anki_venv/
+anki_venv_new/
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+*.log
+config.ini
+config.json

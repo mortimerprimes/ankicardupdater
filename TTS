@@ -1,0 +1,212 @@
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+import requests
+import json
+import base64
+import logging
+import threading
+
+# ------- ANKI UND OPENAI KONSTANTEN ----------
+ANKI_CONNECT_URL = "http://localhost:8765"
+OPENAI_TTS_VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+OPENAI_TTS_MODELS = ["tts-1", "tts-1-hd"]
+
+# ------- ANKI CONNECT FUNKTIONEN -----------
+def anki_invoke(action, params=None):
+    try:
+        req = {"action": action, "version": 6, "params": params or {}}
+        r = requests.post(ANKI_CONNECT_URL, json=req, timeout=30)
+        return r.json()
+    except Exception as e:
+        logging.exception("Anki invoke Fehler")
+        return {"error": str(e)}
+
+def store_media_file(filename, file_content):
+    b64 = base64.b64encode(file_content).decode("utf-8")
+    params = {"filename": filename, "data": b64}
+    res = anki_invoke("storeMediaFile", params)
+    if res.get("error"):
+        raise Exception(str(res["error"]))
+
+def update_note_audio(note_id, audio_field, audio_filename):
+    params = {
+        "note": {
+            "id": note_id,
+            "fields": {
+                audio_field: f"[sound:{audio_filename}]"
+            }
+        }
+    }
+    res = anki_invoke("updateNoteFields", params)
+    if res.get("error"):
+        raise Exception(str(res["error"]))
+
+def get_deck_names():
+    result = anki_invoke("deckNames")
+    if result.get("error"):
+        return []
+    return result.get("result", [])
+
+# -------- OPENAI TTS FUNKTION --------------
+def openai_tts(text, openai_key, voice, model, speed=1.0):
+    url = 'https://api.openai.com/v1/audio/speech'
+    headers = {"Authorization": f"Bearer {openai_key}"}
+    ttspayload = {
+        "model": model,
+        "input": text,
+        "voice": voice,
+        "speed": speed
+    }
+    r = requests.post(url, headers=headers, json=ttspayload, timeout=60)
+    if r.status_code == 200:
+        return r.content
+    else:
+        raise Exception(f"OpenAI TTS Fehler: {r.status_code} - {r.text}")
+
+# ------------ GUI-ANWENDUNGSHÜLLE -----------------
+class Application(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Anki Audio per OpenAI-TTS")
+        self.geometry("700x600")
+        self.configure(bg="#EFEFEF")
+        self.progress_var = tk.DoubleVar(value=0)
+        self.create_widgets()
+        self.all_decks = []
+        threading.Thread(target=self.fetch_decks, daemon=True).start()
+
+    def create_widgets(self):
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+        row = 0
+
+        # OpenAI Key
+        ttk.Label(frm, text="OpenAI API-Key:").grid(row=row, column=0, sticky='w')
+        self.key_entry = ttk.Entry(frm, width=54, show="*")
+        self.key_entry.grid(row=row, column=1, sticky='w')
+        row += 1
+
+        # Deck-Auswahl
+        ttk.Label(frm, text="Anki Deck:").grid(row=row, column=0, sticky='w', pady=8)
+        self.deck_cb = ttk.Combobox(frm, width=51, state='readonly')
+        self.deck_cb['values'] = ["Lade ..."]
+        self.deck_cb.current(0)
+        self.deck_cb.grid(row=row, column=1, sticky='w', pady=8)
+        row += 1
+
+        # Stimme
+        ttk.Label(frm, text="Stimme:").grid(row=row, column=0, sticky='w')
+        self.voice_cb = ttk.Combobox(frm, width=15, state="readonly")
+        self.voice_cb['values'] = OPENAI_TTS_VOICES
+        self.voice_cb.set("alloy")
+        self.voice_cb.grid(row=row, column=1, sticky='w')
+        row += 1
+
+        # Modell
+        ttk.Label(frm, text="Qualität/Modell:").grid(row=row, column=0, sticky='w')
+        self.model_cb = ttk.Combobox(frm, width=15, state='readonly')
+        self.model_cb['values'] = OPENAI_TTS_MODELS
+        self.model_cb.set("tts-1")
+        self.model_cb.grid(row=row, column=1, sticky='w')
+        row += 1
+
+        # Geschwindigkeit
+        ttk.Label(frm, text="Geschwindigkeit (0,25–4,0):").grid(row=row, column=0, sticky='w')
+        self.speed_scl = ttk.Scale(frm, from_=0.25, to=4.0, orient=tk.HORIZONTAL, length=180, resolution=0.05)
+        self.speed_scl.set(1.0)
+        self.speed_scl.grid(row=row, column=1, sticky="w")
+        row += 1
+
+        # Info
+        ttk.Label(frm, text="Textquelle: Feld 'Extra'. Ziel: 'Audio'. Ausgabe nur falls Audio leer ist. Sprache automatisch erkannt.", foreground="grey").grid(
+            row=row, column=0, columnspan=2, sticky='w', pady=(8,2))
+        row += 1
+
+        # Buttons + Fortschritt
+        self.start_btn = ttk.Button(frm, text="Audio für alle Karten generieren", command=self.start_tts_generation)
+        self.start_btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10,2))
+        row += 1
+        self.progress = ttk.Progressbar(frm, variable=self.progress_var, maximum=100)
+        self.progress.grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
+        row += 1
+
+        # Log
+        ttk.Label(frm, text="Log:").grid(row=row, column=0, sticky='sw')
+        row += 1
+        self.log_area = scrolledtext.ScrolledText(frm, height=18, wrap=tk.WORD, font=("Segoe UI",10), state="disabled")
+        self.log_area.grid(row=row, column=0, columnspan=2, sticky='nsew')
+
+        frm.rowconfigure(row, weight=2)
+        frm.columnconfigure(1, weight=1)
+
+    def log(self, msg):
+        self.log_area.config(state="normal")
+        self.log_area.insert("end", msg + "\n")
+        self.log_area.see("end")
+        self.log_area.config(state="disabled")
+        logging.info(msg)
+
+    def fetch_decks(self):
+        self.all_decks = get_deck_names()
+        self.deck_cb['values'] = self.all_decks or ["Keine Decks gefunden!"]
+        if self.all_decks:
+            self.deck_cb.current(0)
+
+    def start_tts_generation(self):
+        self.start_btn.config(state=tk.DISABLED)
+        self.progress_var.set(0)
+        threading.Thread(target=self.run_tts_for_notes, daemon=True).start()
+
+    def run_tts_for_notes(self):
+        deck_name = self.deck_cb.get()
+        api_key = self.key_entry.get().strip()
+        voice = self.voice_cb.get()
+        model = self.model_cb.get()
+        speed = float(self.speed_scl.get())
+        if not all([deck_name, api_key, voice, model]):
+            self.log("Bitte alle Einstellungen ausfüllen!")
+            self.start_btn.config(state=tk.NORMAL)
+            return
+
+        note_ids = anki_invoke("findNotes", {"query": f'deck:"{deck_name}"'}).get("result", [])
+        if not note_ids:
+            self.log("Keine Karten gefunden.")
+            self.start_btn.config(state=tk.NORMAL)
+            return
+
+        notes = anki_invoke("notesInfo", {"notes": note_ids}).get("result", [])
+        total = len(notes)
+        n_done = 0
+        for note in notes:
+            try:
+                note_id = note['noteId']
+                fields = note.get('fields', {})
+                audio_val = fields.get('Audio', {}).get('value', '')
+                extra_val = fields.get('Extra', {}).get('value', '').strip()
+                if audio_val.strip():
+                    self.log(f"Überspringe {note_id}: 'Audio' schon belegt.")
+                    n_done += 1
+                    self.progress_var.set(n_done/total*100)
+                    continue
+                if not extra_val:
+                    self.log(f"{note_id}: Leeres Extra-Feld, überspringe.")
+                    n_done += 1
+                    self.progress_var.set(n_done/total*100)
+                    continue
+                filename = f"tts_{note_id}.mp3"
+                self.log(f"{note_id}: Erzeuge Audio ({voice}) …")
+                audio = openai_tts(extra_val, api_key, voice, model, speed)
+                store_media_file(filename, audio)
+                update_note_audio(note_id, 'Audio', filename)
+                self.log(f"{note_id}: Audio gespeichert ({filename})")
+            except Exception as ex:
+                self.log(f"{note.get('noteId','?')}: Fehler: {str(ex)}")
+            n_done += 1
+            self.progress_var.set(n_done/total*100)
+        self.log("TTS-Generierung abgeschlossen.")
+        self.start_btn.config(state=tk.NORMAL)
+
+if __name__ == '__main__':
+    logging.basicConfig(filename='anki_tts.log', level=logging.INFO)
+    app = Application()
+    app.mainloop()
