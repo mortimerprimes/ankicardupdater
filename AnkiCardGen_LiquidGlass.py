@@ -11,6 +11,7 @@ import os
 import configparser
 import logging
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 from pathlib import Path
@@ -19,8 +20,11 @@ from pathlib import Path
 APP_NAME = "Anki Card Updater"
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+ANKI_TIMEOUT = 60
+OPENROUTER_TIMEOUT = 90
+MODEL_FETCH_TIMEOUT = 20
 
-logging.basicConfig(filename=APP_SUPPORT_DIR / "anki_updater.log", level=logging.DEBUG,
+logging.basicConfig(filename=APP_SUPPORT_DIR / "anki_updater.log", level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
 
 DETAILED_LOGGING = False
@@ -42,7 +46,7 @@ class ConfigManager:
     }
 
     def __init__(self):
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(interpolation=None)
         if os.path.exists(self.CONFIG_FILE):
             self.config.read(self.CONFIG_FILE)
         else:
@@ -55,7 +59,7 @@ class ConfigManager:
 
     def merge_legacy_values(self):
         if self.LEGACY_CONFIG_FILE.exists():
-            legacy = configparser.ConfigParser()
+            legacy = configparser.ConfigParser(interpolation=None)
             legacy.read(self.LEGACY_CONFIG_FILE)
             for key in self.DEFAULT:
                 value = legacy['DEFAULT'].get(key, '').strip()
@@ -90,9 +94,15 @@ class ConfigManager:
 
 ANKI_URL = 'http://localhost:8765'
 
-def anki_invoke(action, params={}):
+def anki_invoke(action, params=None):
     try:
-        return requests.post(ANKI_URL, json={'action': action, 'version': 6, 'params': params}).json()
+        response = requests.post(
+            ANKI_URL,
+            json={'action': action, 'version': 6, 'params': params or {}},
+            timeout=ANKI_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
     except Exception as e:
         return {"error": str(e)}
 
@@ -102,22 +112,36 @@ def get_deck_names():
 
 def fetch_models_api(api_key):
     try:
-        r = requests.get("https://openrouter.ai/api/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+        r = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=MODEL_FETCH_TIMEOUT,
+        )
+        r.raise_for_status()
         return [m["id"] for m in r.json().get("data", []) if "id" in m]
-    except:
+    except Exception as e:
+        logging.exception("Modelle konnten nicht geladen werden")
         return []
 
 def get_ai_response(api_key, model, frage, prompt, log_cb, max_tokens, temp, top_p, rm_cloze):
     if rm_cloze:
         frage = remove_cloze(frage)
     try:
-        r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+        r = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"model": model, "messages": [{"role": "user", "content": prompt.replace("{frage}", frage)}],
-                  "max_tokens": max_tokens, "temperature": temp, "top_p": top_p})
-        return r.json()["choices"][0]["message"]["content"].strip() if r.status_code == 200 else ""
+                  "max_tokens": max_tokens, "temperature": temp, "top_p": top_p},
+            timeout=OPENROUTER_TIMEOUT,
+        )
+        if r.status_code != 200:
+            log_cb(f"OpenRouter Fehler {r.status_code}: {r.text[:160]}")
+            return ""
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        log_cb(f"Fehler: {e}")
+        logging.exception("OpenRouter-Anfrage fehlgeschlagen")
+        log_cb(f"OpenRouter Anfrage fehlgeschlagen: {e}")
         return ""
 
 
@@ -128,32 +152,59 @@ class AnkiUpdater:
     def process(self, deck, api_key, model, prompt, target, question, fill_mode, conc, progress_cb, cancel, max_t, temp, top_p, rm_cloze):
         self.log("🔍 Suche Notizen...")
         find = anki_invoke("findNotes", {"query": f'deck:"{deck}"'})
-        if find.get("error") or not find.get("result"):
+        if find.get("error"):
+            self.log(f"AnkiConnect Fehler bei findNotes: {find['error']}")
+            return {"updated": 0, "skipped": 0, "errors": 1}
+        if not find.get("result"):
             self.log("Keine Notizen gefunden")
-            return
-        notes = anki_invoke("notesInfo", {"notes": find["result"]}).get("result", [])
+            return {"updated": 0, "skipped": 0, "errors": 0}
+
+        self.log("📥 Lade Notizdetails...")
+        info = anki_invoke("notesInfo", {"notes": find["result"]})
+        if info.get("error"):
+            self.log(f"AnkiConnect Fehler bei notesInfo: {info['error']}")
+            return {"updated": 0, "skipped": 0, "errors": 1}
+
+        notes = info.get("result", [])
         total, done = len(notes), 0
         self.log(f"📚 {total} Notizen")
+        stats = {"updated": 0, "skipped": 0, "errors": 0}
 
         with ThreadPoolExecutor(max_workers=max(1, conc)) as pool:
             futures = [pool.submit(self._proc, n, api_key, model, prompt, target, question, fill_mode, max_t, temp, top_p, rm_cloze) for n in notes]
             for f in as_completed(futures):
                 if cancel():
+                    for pending in futures:
+                        pending.cancel()
                     break
+                try:
+                    result = f.result()
+                    if result in stats:
+                        stats[result] += 1
+                except Exception as e:
+                    stats["errors"] += 1
+                    logging.exception("Notizverarbeitung fehlgeschlagen")
+                    self.log(f"Fehler bei einer Notiz: {e}")
                 done += 1
                 progress_cb(done, total)
-        self.log("✅ Fertig")
+        self.log(f"✅ Fertig: {stats['updated']} aktualisiert, {stats['skipped']} übersprungen, {stats['errors']} Fehler")
+        return stats
 
     def _proc(self, note, api_key, model, prompt, target, question, fill_mode, max_t, temp, top_p, rm_cloze):
         frage = note["fields"].get(question, {}).get("value", "")
         current = note["fields"].get(target, {}).get("value", "")
         if not frage or (current.strip() and fill_mode == "Überspringen"):
-            return
+            return "skipped"
         answer = get_ai_response(api_key, model, frage, prompt, self.log, max_t, temp, top_p, rm_cloze)
         if answer:
             new_val = answer if fill_mode != "Anhängen" or not current.strip() else f"{current.strip()}\n{answer}"
-            anki_invoke("updateNoteFields", {"note": {"id": note["noteId"], "fields": {target: new_val}}})
+            updated = anki_invoke("updateNoteFields", {"note": {"id": note["noteId"], "fields": {target: new_val}}})
+            if updated.get("error"):
+                self.log(f"Update-Fehler bei {note['noteId']}: {updated['error']}")
+                return "errors"
             self.log(f"✓ {note['noteId']}")
+            return "updated"
+        return "errors"
 
 
 def main(page: ft.Page):
@@ -231,10 +282,14 @@ def main(page: ft.Page):
     log_view = ft.ListView(spacing=2, auto_scroll=True, expand=True)
 
     def log(msg):
-        log_view.controls.append(ft.Text(f"› {msg}", size=11, color="#8e8e93"))
-        if len(log_view.controls) > 100:
-            log_view.controls.pop(0)
-        page.update()
+        logging.info(msg)
+        try:
+            log_view.controls.append(ft.Text(f"› {msg}", size=11, color="#8e8e93"))
+            if len(log_view.controls) > 100:
+                log_view.controls.pop(0)
+            page.update()
+        except Exception:
+            logging.exception("Log-Update in der UI fehlgeschlagen")
 
     def set_status(txt, col):
         status.value, status.color = f"● {txt}", col
@@ -335,13 +390,28 @@ def main(page: ft.Page):
             log("⚠️ Felder ausfüllen!")
             return
 
+        target_field = t_field.value or 'Extra'
+        question_field = q_field.value or 'Text'
+        fill_mode = fill_dd.value or 'Überspringen'
+        if target_field == question_field and fill_mode == "Überspringen":
+            set_status("Option prüfen", "#ff9500")
+            log("⚠️ Frage-Feld und Ziel-Feld sind gleich. Mit „Überspringen“ wird jede bereits gefüllte Karte übersprungen. Wähle „Überschreiben“ oder ein anderes Ziel-Feld.")
+            return
+
         cancelled = False
+
+        try:
+            persist_settings()
+        except Exception as ex:
+            logging.exception("Einstellungen konnten nicht gespeichert werden")
+            set_status("Speichern fehlgeschlagen", "#ff3b30")
+            log(f"⚠️ Einstellungen konnten nicht gespeichert werden: {ex}")
+            return
+
         set_status("Läuft...", "#007aff")
         progress.value, progress.color, progress_txt.value = 0, "#007aff", "0%"
         start_btn.disabled, cancel_btn.disabled = True, False
         page.update()
-
-        persist_settings()
 
         def run():
             nonlocal cancelled
@@ -352,13 +422,24 @@ def main(page: ft.Page):
                     progress.color = "#34c759"
                 page.update()
 
-            AnkiUpdater(log).process(d, k.strip(), m, p.strip(), t_field.value or 'Extra',
-                                     q_field.value or 'Text', fill_dd.value, concurrency,
-                                     prog, lambda: cancelled, max_tokens, temperature, top_p, cloze_sw.value)
-
-            start_btn.disabled, cancel_btn.disabled = False, True
-            set_status("Abgebrochen" if cancelled else "Fertig!", "#ff9500" if cancelled else "#34c759")
-            page.update()
+            try:
+                stats = AnkiUpdater(log).process(
+                    d, k.strip(), m, p.strip(), target_field, question_field, fill_mode, concurrency,
+                    prog, lambda: cancelled, max_tokens, temperature, top_p, cloze_sw.value
+                )
+                if cancelled:
+                    set_status("Abgebrochen", "#ff9500")
+                elif stats and stats.get("errors"):
+                    set_status("Mit Fehlern fertig", "#ff9500")
+                else:
+                    set_status("Fertig!", "#34c759")
+            except Exception as ex:
+                logging.error("Startlauf fehlgeschlagen:\n%s", traceback.format_exc())
+                log(f"❌ Lauf abgebrochen: {ex}")
+                set_status("Fehler", "#ff3b30")
+            finally:
+                start_btn.disabled, cancel_btn.disabled = False, True
+                page.update()
 
         threading.Thread(target=run, daemon=True).start()
 

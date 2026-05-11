@@ -33,8 +33,7 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
   python3 -m venv "$VENV_DIR"
 fi
 
-"$VENV_DIR/bin/python" -m pip install --upgrade pip
-"$VENV_DIR/bin/python" -m pip install -r requirements.txt
+"$VENV_DIR/bin/python" -m pip install --disable-pip-version-check -r requirements.txt
 
 rm -rf "$APP_BUNDLE"
 
@@ -47,10 +46,6 @@ PYINSTALLER_ARGS=(
   --collect-all flet
   --collect-all flet_desktop
 )
-
-if [ -f "config.ini" ]; then
-  PYINSTALLER_ARGS+=(--add-data "config.ini:.")
-fi
 
 "$VENV_DIR/bin/python" -m PyInstaller "${PYINSTALLER_ARGS[@]}" "$ENTRYPOINT"
 
